@@ -19,7 +19,9 @@ class CTMaterialAnalyzer:
         self.height = 105
 
         # Material color mapping (consistent with C code)
+        # 注意：将Unknown放在第一个位置，这样-1会映射到Unknown的灰色
         self.material_colors = {
+            'Unknown': (200 / 255, 200 / 255, 200 / 255),  # Gray - 放在第一位
             'LiMetal': (255 / 255, 0 / 255, 0 / 255),  # Red
             'MnO2': (0 / 255, 0 / 255, 255 / 255),  # Blue
             'Li0.1MnO2': (0 / 255, 50 / 255, 255 / 255),  # Light blue
@@ -32,18 +34,19 @@ class CTMaterialAnalyzer:
             'Li0.8MnO2': (0 / 255, 255 / 255, 100 / 255),  # Orange-yellow
             'Li0.9MnO2': (0 / 255, 255 / 255, 50 / 255),  # Orange
             'LiMnO2': (0 / 255, 255 / 255, 0 / 255),  # Green
-            'Unknown': (200 / 255, 200 / 255, 200 / 255)  # Gray
         }
 
         # Define region coordinates (consistent with C code)
         self.regions = {
             'fresh': {
                 'material': {'min_x': 44, 'max_x': 65, 'min_y': 22, 'max_y': 85},
-                'cathode': {'min_x': 47, 'max_x': 61, 'min_y': 22, 'max_y': 85}
+                'cathode': {'min_x': 47, 'max_x': 61, 'min_y': 22, 'max_y': 85},
+                'anode': {'min_x': 63, 'max_x': 65, 'min_y': 22, 'max_y': 85}
             },
             'discharged': {
                 'material': {'min_x': 45, 'max_x': 67, 'min_y': 30, 'max_y': 83},
-                'cathode': {'min_x': 49, 'max_x': 60, 'min_y': 31, 'max_y': 82}
+                'cathode': {'min_x': 49, 'max_x': 60, 'min_y': 31, 'max_y': 82},
+                'anode': {'min_x': 63, 'max_x': 65, 'min_y': 22, 'max_y': 85}
             }
         }
 
@@ -100,12 +103,34 @@ class CTMaterialAnalyzer:
                 self.df.loc[self.df['Material'] == 'LiMetal', 'Material'] = 'Unknown'
                 print("Discharged state: Lithium metal reclassified as Unknown")
 
+            # For fresh state, only keep lithium metal in anode region
+            elif self.state == 'fresh' and 'Material' in self.df.columns:
+                anode_region = self.regions[self.state]['anode']
+
+                # 创建掩码：识别LiMetal且在阳极区域外的点
+                mask_li_metal = self.df['Material'] == 'LiMetal'
+                mask_not_in_anode = ~(
+                        (self.df['X'] >= anode_region['min_x']) &
+                        (self.df['X'] <= anode_region['max_x']) &
+                        (self.df['Y'] >= anode_region['min_y']) &
+                        (self.df['Y'] <= anode_region['max_y'])
+                )
+
+                # 将阳极区域外的LiMetal重新分类为Unknown
+                li_metal_outside_anode = mask_li_metal & mask_not_in_anode
+                if li_metal_outside_anode.any():
+                    count = li_metal_outside_anode.sum()
+                    self.df.loc[li_metal_outside_anode, 'Material'] = 'Unknown'
+                    print(f"Fresh state: {count} LiMetal pixels outside anode region reclassified as Unknown")
+                else:
+                    print("Fresh state: All LiMetal pixels are within anode region")
+
             # Check required columns
             required_cols = ['X', 'Y', 'Material', 'Pe', 'Zeff', 'SOC']
             missing_cols = [col for col in required_cols if col not in self.df.columns]
             if missing_cols:
                 print(f"Warning: Missing columns {missing_cols}")
-                
+
             return True
 
         except Exception as e:
@@ -117,26 +142,27 @@ class CTMaterialAnalyzer:
         Get data for specified region
 
         Parameters:
-        region_type: str, region type ('material' or 'cathode')
+        region_type: str, region type ('material', 'cathode', or 'anode')
         """
         if self.state not in self.regions:
             return self.df
 
         if region_type not in self.regions[self.state]:
+            print(f"Warning: Region type '{region_type}' not defined for state '{self.state}'")
             return self.df
 
         region = self.regions[self.state][region_type]
-        
+
         # Ensure columns exist
         if 'X' not in self.df.columns or 'Y' not in self.df.columns:
             print("Error: Data missing X or Y columns")
             return pd.DataFrame()
 
         mask = (
-            (self.df['X'] >= region['min_x']) &
-            (self.df['X'] <= region['max_x']) &
-            (self.df['Y'] >= region['min_y']) &
-            (self.df['Y'] <= region['max_y'])
+                (self.df['X'] >= region['min_x']) &
+                (self.df['X'] <= region['max_x']) &
+                (self.df['Y'] >= region['min_y']) &
+                (self.df['Y'] <= region['max_y'])
         )
 
         return self.df[mask]
@@ -150,8 +176,8 @@ class CTMaterialAnalyzer:
         """
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
 
-        # Material distribution map
-        material_map = np.full((self.height, self.width), -1, dtype=int)
+        # Material distribution map - 初始化为Unknown（灰色）
+        material_map = np.full((self.height, self.width), 0, dtype=int)  # 0对应Unknown
         material_names = list(self.material_colors.keys())
 
         # Check required columns
@@ -161,14 +187,18 @@ class CTMaterialAnalyzer:
             print(f"Error: Missing required columns {missing_cols}")
             return
 
-        for _, row in self.df.iterrows():
+        # 获取材料区域的数据
+        material_region_data = self.get_region_data('material')
+
+        # 只绘制材料区域内的点
+        for _, row in material_region_data.iterrows():
             try:
                 x, y = int(row['X']), int(row['Y'])
                 material = str(row['Material'])
                 if material in material_names:
                     material_map[y, x] = material_names.index(material)
                 else:
-                    material_map[y, x] = material_names.index('Unknown')
+                    material_map[y, x] = 0  # Unknown
             except Exception:
                 continue
 
@@ -183,7 +213,7 @@ class CTMaterialAnalyzer:
         ax1.set_xlabel('X (pixel)')
         ax1.set_ylabel('Y (pixel)')
 
-        # Highlight cathode region
+        # Highlight cathode region - 保留矩形框，移除文字标注
         if self.state in self.regions:
             region = self.regions[self.state]['cathode']
             rect = Rectangle((region['min_x'], region['min_y']),
@@ -191,10 +221,29 @@ class CTMaterialAnalyzer:
                              region['max_y'] - region['min_y'],
                              linewidth=2, edgecolor='red', facecolor='none')
             ax1.add_patch(rect)
-            ax1.text(region['min_x'], region['min_y'] - 5, 'Cathode Region',
-                     color='red', fontweight='bold')
+            # 移除文字标注: ax1.text(region['min_x'], region['min_y'] - 5, 'Cathode Region',
+            #             color='red', fontweight='bold')
 
-        # Create legend - skip LiMetal for discharged state
+            # Highlight anode region (only for fresh state) - 保留矩形框，移除文字标注
+            if self.state == 'fresh':
+                anode_region = self.regions[self.state]['anode']
+                rect_anode = Rectangle((anode_region['min_x'], anode_region['min_y']),
+                                       anode_region['max_x'] - anode_region['min_x'],
+                                       anode_region['max_y'] - anode_region['min_y'],
+                                       linewidth=2, edgecolor='orange', facecolor='none', linestyle='--')
+                ax1.add_patch(rect_anode)
+                # 移除文字标注: ax1.text(anode_region['min_x'], anode_region['min_y'] - 5, 'Anode Region',
+                #          color='orange', fontweight='bold')
+
+            # Highlight material region boundary - 保留矩形框，移除文字标注
+            material_region = self.regions[self.state]['material']
+            rect_material = Rectangle((material_region['min_x'], material_region['min_y']),
+                                      material_region['max_x'] - material_region['min_x'],
+                                      material_region['max_y'] - material_region['min_y'],
+                                      linewidth=1, edgecolor='black', facecolor='none', linestyle=':')
+            ax1.add_patch(rect_material)
+
+        # 创建图例 - 跳过放电状态的LiMetal
         legend_elements = []
         for material, color in self.material_colors.items():
             if self.state == 'discharged' and material == 'LiMetal':
@@ -203,10 +252,10 @@ class CTMaterialAnalyzer:
 
         ax1.legend(handles=legend_elements, bbox_to_anchor=(1.05, 1), loc='upper left')
 
-        # SOC distribution map
+        # SOC distribution map - 也限制在材料区域内
         soc_map = np.zeros((self.height, self.width))
-        if 'SOC' in self.df.columns:
-            for _, row in self.df.iterrows():
+        if 'SOC' in material_region_data.columns:
+            for _, row in material_region_data.iterrows():
                 try:
                     x, y = int(row['X']), int(row['Y'])
                     soc_map[y, x] = float(row['SOC'])
@@ -220,7 +269,7 @@ class CTMaterialAnalyzer:
         ax2.set_xlabel('X (pixel)')
         ax2.set_ylabel('Y (pixel)')
 
-        # Highlight cathode region
+        # Highlight cathode region in SOC map - 保留矩形框，移除文字标注
         if self.state in self.regions:
             region = self.regions[self.state]['cathode']
             rect = Rectangle((region['min_x'], region['min_y']),
@@ -228,6 +277,23 @@ class CTMaterialAnalyzer:
                              region['max_y'] - region['min_y'],
                              linewidth=2, edgecolor='red', facecolor='none')
             ax2.add_patch(rect)
+
+            # Highlight anode region (only for fresh state) - 保留矩形框，移除文字标注
+            if self.state == 'fresh':
+                anode_region = self.regions[self.state]['anode']
+                rect_anode = Rectangle((anode_region['min_x'], anode_region['min_y']),
+                                       anode_region['max_x'] - anode_region['min_x'],
+                                       anode_region['max_y'] - anode_region['min_y'],
+                                       linewidth=2, edgecolor='orange', facecolor='none', linestyle='--')
+                ax2.add_patch(rect_anode)
+
+            # Highlight material region boundary - 保留矩形框，移除文字标注
+            material_region = self.regions[self.state]['material']
+            rect_material = Rectangle((material_region['min_x'], material_region['min_y']),
+                                      material_region['max_x'] - material_region['min_x'],
+                                      material_region['max_y'] - material_region['min_y'],
+                                      linewidth=1, edgecolor='black', facecolor='none', linestyle=':')
+            ax2.add_patch(rect_material)
 
         plt.colorbar(im2, ax=ax2, label='SOC (%)')
         plt.tight_layout()
@@ -260,6 +326,9 @@ class CTMaterialAnalyzer:
             plt.close(fig)
             return
 
+        # 只使用材料区域内的数据进行绘制
+        material_region_data = self.get_region_data('material')
+
         # Scatter plot colored by material type
         for material, color in self.material_colors.items():
             if material == 'Unknown':
@@ -268,9 +337,9 @@ class CTMaterialAnalyzer:
             if self.state == 'discharged' and material == 'LiMetal':
                 continue
 
-            mask = self.df['Material'] == material
+            mask = material_region_data['Material'] == material
             if mask.any():
-                ax1.scatter(self.df.loc[mask, 'Pe'], self.df.loc[mask, 'Zeff'],
+                ax1.scatter(material_region_data.loc[mask, 'Pe'], material_region_data.loc[mask, 'Zeff'],
                             c=[color], label=material, alpha=0.7, s=10)
 
         ax1.set_xlabel('Pe (e/cm³)')
@@ -281,9 +350,9 @@ class CTMaterialAnalyzer:
         ax1.set_xscale('log')
 
         # Scatter plot colored by SOC
-        if 'SOC' in self.df.columns:
-            scatter = ax2.scatter(self.df['Pe'], self.df['Zeff'],
-                                  c=self.df['SOC'], cmap=self.soc_cmap,
+        if 'SOC' in material_region_data.columns:
+            scatter = ax2.scatter(material_region_data['Pe'], material_region_data['Zeff'],
+                                  c=material_region_data['SOC'], cmap=self.soc_cmap,
                                   alpha=0.7, s=10, vmin=0, vmax=100)
             ax2.set_xlabel('Pe (e/cm³)')
             ax2.set_ylabel('Zeff')
@@ -342,9 +411,12 @@ class CTMaterialAnalyzer:
         fig, axes = plt.subplots(2, 2, figsize=(16, 12))
         ax1, ax2, ax3, ax4 = axes[0, 0], axes[0, 1], axes[1, 0], axes[1, 1]
 
-        # α value distribution map
-        alpha_map = np.full((self.height, self.width), -1.0, dtype=float)
-        for _, row in self.df.iterrows():
+        # 只使用材料区域内的数据进行绘制
+        material_region_data = self.get_region_data('material')
+
+        # α value distribution map - 只绘制材料区域内的点
+        alpha_map = np.full((self.height, self.width), np.nan, dtype=float)  # 使用NaN表示无数据
+        for _, row in material_region_data.iterrows():
             try:
                 x, y = int(row['X']), int(row['Y'])
                 alpha = float(row['Alpha'])
@@ -358,7 +430,7 @@ class CTMaterialAnalyzer:
         ax1.set_xlabel('X (pixel)')
         ax1.set_ylabel('Y (pixel)')
 
-        # Highlight cathode region
+        # Highlight cathode region - 保留矩形框，移除文字标注
         if self.state in self.regions:
             region = self.regions[self.state]['cathode']
             rect = Rectangle((region['min_x'], region['min_y']),
@@ -367,11 +439,19 @@ class CTMaterialAnalyzer:
                              linewidth=2, edgecolor='red', facecolor='none')
             ax1.add_patch(rect)
 
+            # Highlight material region boundary - 保留矩形框，移除文字标注
+            material_region = self.regions[self.state]['material']
+            rect_material = Rectangle((material_region['min_x'], material_region['min_y']),
+                                      material_region['max_x'] - material_region['min_x'],
+                                      material_region['max_y'] - material_region['min_y'],
+                                      linewidth=1, edgecolor='black', facecolor='none', linestyle=':')
+            ax1.add_patch(rect_material)
+
         plt.colorbar(im1, ax=ax1, label='α value')
 
-        # β value distribution map
-        beta_map = np.full((self.height, self.width), -1.0, dtype=float)
-        for _, row in self.df.iterrows():
+        # β value distribution map - 只绘制材料区域内的点
+        beta_map = np.full((self.height, self.width), np.nan, dtype=float)  # 使用NaN表示无数据
+        for _, row in material_region_data.iterrows():
             try:
                 x, y = int(row['X']), int(row['Y'])
                 beta = float(row['Beta'])
@@ -385,13 +465,20 @@ class CTMaterialAnalyzer:
         ax2.set_xlabel('X (pixel)')
         ax2.set_ylabel('Y (pixel)')
 
-        # Highlight cathode region
+        # Highlight cathode region - 保留矩形框，移除文字标注
         if self.state in self.regions:
             rect = Rectangle((region['min_x'], region['min_y']),
                              region['max_x'] - region['min_x'],
                              region['max_y'] - region['min_y'],
                              linewidth=2, edgecolor='red', facecolor='none')
             ax2.add_patch(rect)
+
+            # Highlight material region boundary - 保留矩形框，移除文字标注
+            rect_material = Rectangle((material_region['min_x'], material_region['min_y']),
+                                      material_region['max_x'] - material_region['min_x'],
+                                      material_region['max_y'] - material_region['min_y'],
+                                      linewidth=1, edgecolor='black', facecolor='none', linestyle=':')
+            ax2.add_patch(rect_material)
 
         plt.colorbar(im2, ax=ax2, label='β value')
 
@@ -558,6 +645,7 @@ class CTMaterialAnalyzer:
 
         # 4. Cathode region SOC spatial distribution
         if 'SOC' in cathode_df.columns:
+            # 只绘制阴极区域内的SOC分布
             cathode_soc_map = np.full((self.height, self.width), np.nan)
             for _, row in cathode_df.iterrows():
                 try:
@@ -570,6 +658,16 @@ class CTMaterialAnalyzer:
             ax4.set_title('Cathode Region SOC Spatial Distribution')
             ax4.set_xlabel('X (pixel)')
             ax4.set_ylabel('Y (pixel)')
+
+            # 在图上标出阴极区域边界 - 保留矩形框，移除文字标注
+            if self.state in self.regions:
+                region = self.regions[self.state]['cathode']
+                rect = Rectangle((region['min_x'], region['min_y']),
+                                 region['max_x'] - region['min_x'],
+                                 region['max_y'] - region['min_y'],
+                                 linewidth=2, edgecolor='red', facecolor='none')
+                ax4.add_patch(rect)
+
             plt.colorbar(im, ax=ax4, label='SOC (%)')
         else:
             ax4.text(0.5, 0.5, 'Missing SOC data', ha='center', va='center', transform=ax4.transAxes)
@@ -590,27 +688,30 @@ class CTMaterialAnalyzer:
         print(f"CT Material Analysis Report - {self.state.upper()}")
         print("=" * 70)
 
+        # 只分析材料区域内的数据
+        material_region_data = self.get_region_data('material')
+
         # Basic statistics
-        total_pixels = len(self.df)
-        print(f"\nGeneral Statistics:")
+        total_pixels = len(material_region_data)
+        print(f"\nGeneral Statistics (Material Region):")
         print("-" * 40)
         print(f"  Total Pixels: {total_pixels}")
-        
-        if 'SOC' in self.df.columns:
-            print(f"  SOC Range: {self.df['SOC'].min():.1f}% - {self.df['SOC'].max():.1f}%")
-            print(f"  Average SOC: {self.df['SOC'].mean():.1f}%")
-            print(f"  SOC Std Dev: {self.df['SOC'].std():.1f}%")
+
+        if 'SOC' in material_region_data.columns:
+            print(f"  SOC Range: {material_region_data['SOC'].min():.1f}% - {material_region_data['SOC'].max():.1f}%")
+            print(f"  Average SOC: {material_region_data['SOC'].mean():.1f}%")
+            print(f"  SOC Std Dev: {material_region_data['SOC'].std():.1f}%")
 
         # Material distribution statistics
-        if 'Material' in self.df.columns:
-            material_stats = self.df['Material'].value_counts()
-            print(f"\nMaterial Distribution:")
+        if 'Material' in material_region_data.columns:
+            material_stats = material_region_data['Material'].value_counts()
+            print(f"\nMaterial Distribution (Material Region):")
             print("-" * 40)
             for material, count in material_stats.items():
                 percentage = (count / total_pixels) * 100
                 print(f"  {material:<15}: {percentage:6.1f}% ({count:6d} pixels)")
         else:
-            print(f"\nMaterial Distribution:")
+            print(f"\nMaterial Distribution (Material Region):")
             print("-" * 40)
             print("  Warning: No Material column in data")
 
@@ -620,7 +721,7 @@ class CTMaterialAnalyzer:
             cathode_total = len(cathode_df)
             print(f"\nCathode Region Analysis ({cathode_total} pixels):")
             print("-" * 40)
-            
+
             if 'Material' in cathode_df.columns:
                 cathode_stats = cathode_df['Material'].value_counts()
                 for material, count in cathode_stats.items():
@@ -628,7 +729,7 @@ class CTMaterialAnalyzer:
                     print(f"  {material:<15}: {percentage:6.1f}% ({count:6d} pixels)")
             else:
                 print("  Warning: No Material column in cathode data")
-            
+
             if 'SOC' in cathode_df.columns:
                 print(f"\nCathode Region SOC Statistics:")
                 print("-" * 40)
@@ -672,6 +773,22 @@ class CTMaterialAnalyzer:
                 print("-" * 40)
                 print("  Warning: No Alpha column in data")
 
+        # Anode region analysis (only for fresh state)
+        if self.state == 'fresh':
+            anode_df = self.get_region_data('anode')
+            if len(anode_df) > 0:
+                anode_total = len(anode_df)
+                print(f"\nAnode Region Analysis ({anode_total} pixels):")
+                print("-" * 40)
+
+                if 'Material' in anode_df.columns:
+                    anode_stats = anode_df['Material'].value_counts()
+                    for material, count in anode_stats.items():
+                        percentage = (count / anode_total) * 100
+                        print(f"  {material:<15}: {percentage:6.1f}% ({count:6d} pixels)")
+                else:
+                    print("  Warning: No Material column in anode data")
+
     def comprehensive_analysis(self, csv_file, output_dir='analysis_results'):
         """
         Perform comprehensive analysis
@@ -714,16 +831,16 @@ class CTMaterialAnalyzer:
         with open(stats_file, 'w', encoding='utf-8') as f:
             import sys
             from io import StringIO
-            
+
             old_stdout = sys.stdout
             new_stdout = StringIO()
             sys.stdout = new_stdout
-            
+
             self.generate_statistical_report()
-            
+
             output = new_stdout.getvalue()
             sys.stdout = old_stdout
-            
+
             f.write(output)
             print(f"Statistical report saved: {stats_file}")
 
@@ -748,7 +865,7 @@ def batch_analyze_all_files(result_dir='result', output_base='analysis_results')
     # Find all material distribution CSV files
     csv_pattern = os.path.join(result_dir, 'MaterialDistribution_*.csv')
     csv_files = glob.glob(csv_pattern)
-    
+
     # If not found, try other patterns
     if not csv_files:
         csv_pattern = os.path.join(result_dir, '*.csv')
@@ -773,7 +890,7 @@ def batch_analyze_all_files(result_dir='result', output_base='analysis_results')
             state = 'discharged'
         else:
             state = 'unknown'
-        
+
         output_dir = os.path.join(output_base, state)
 
         print(f"\n{'=' * 60}")
