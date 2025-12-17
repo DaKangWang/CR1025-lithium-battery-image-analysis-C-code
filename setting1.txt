@@ -1,0 +1,29 @@
+#the_number_of_steps
+105
+#circle_center_x
+12
+#circle_center_y
+13
+#circle_radius
+6
+
+.\CT_Binning-20(sample)\ct_0010.raw	5.25779E-29	6.45397E-25   38.55
+.\CT_Binning-20(sample)\ct_0011.raw	3.8751E-29	6.23357E-25   42.64
+.\CT_Binning-20(sample)\ct_0012.raw	2.94107E-29	6.06016E-25   46.72
+.\CT_Binning-20(sample)\ct_0013.raw	2.28731E-29	5.9181E-25     50.8
+.\CT_Binning-20(sample)\ct_0014.raw	1.81396E-29	5.79867E-25   54.88
+.\CT_Binning-20(sample)\ct_0015.raw	1.46459E-29	5.69151E-25   58.96
+.\CT_Binning-20(sample)\ct_0016.raw	1.20019E-29	5.59878E-25   63.04
+.\CT_Binning-20(sample)\ct_0017.raw	9.96943E-30	5.51192E-25   67.12
+.\CT_Binning-20(sample)\ct_0018.raw	8.37547E-30	5.43392E-25   71.2
+.\CT_Binning-20(sample)\ct_0019.raw	7.11143E-30	5.36156E-25   75.28
+.\CT_Binning-20(sample)\ct_0020.raw	6.09209E-30	5.29333E-25   79.37
+.\CT_Binning-20(sample)\ct_0021.raw	5.27643E-30	5.22595E-25   83.45
+.\CT_Binning-20(sample)\ct_0022.raw	4.60383E-30	5.16392E-25   87.53
+.\CT_Binning-20(sample)\ct_0023.raw	4.03039E-30	5.10671E-25   91.61
+.\CT_Binning-20(sample)\ct_0024.raw	3.56519E-30	5.0494E-25     95.69
+.\CT_Binning-20(sample)\ct_0025.raw	3.15857E-30	4.99695E-25   99.77
+.\CT_Binning-20(sample)\ct_0026.raw	2.81959E-30	4.94444E-25   103.85
+.\CT_Binning-20(sample)\ct_0027.raw	2.53185E-30	4.89462E-25   107.93
+.\CT_Binning-20(sample)\ct_0028.raw	2.29492E-30	4.84419E-25   112.01
+.\CT_Binning-20(sample)\ct_0029.raw	2.06905E-30	4.79979E-25   116.1	
