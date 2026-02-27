@@ -1,0 +1,616 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
+import matplotlib.patches as patches
+from pathlib import Path
+import matplotlib
+from matplotlib.colors import ListedColormap
+matplotlib.use('TkAgg')
+
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
+
+
+class InteractiveBatteryCTAnalyzer:
+    def __init__(self, data_dir="result"):
+        self.data_dir = Path(data_dir)
+        self.kv100_filename = "2025-12-29-100kVScene.png"
+        self.kv150_filename = "2025-12-29-150kV.png"
+        self.kv100_path = self.data_dir / self.kv100_filename
+        self.kv150_path = self.data_dir / self.kv150_filename
+
+        print("Interactive Battery CT Analyzer Initialized")
+        print(f"Data Directory: {self.data_dir}")
+        print(f"100kV Image: {self.kv100_path}")
+        print(f"150kV Image: {self.kv150_path}")
+
+        # 电池区域坐标（更新描述，区分 SOC 和 SOH）
+        self.battery_regions = {
+            'Lw': {
+                'type': 'rectangle',
+                'coords': {'x_min': 800, 'x_max': 1150, 'y_min': 1050, 'y_max': 1300},
+                'color': 'purple', 'alpha': 0.3, 'label': 'Whole Battery Area (Lw)'
+            },
+            'L1': {
+                'type': 'polygon',
+                'coords': [(850, 1100), (851, 1140), (990, 1110), (975, 1075)],
+                'color': 'red', 'alpha': 0.7, 'label': 'Battery 1 (L1)'
+            },
+            'L2': {
+                'type': 'polygon',
+                'coords': [(860, 1150), (865, 1190), (1019, 1160), (1011, 1125)],
+                'color': 'blue', 'alpha': 0.7, 'label': 'Battery 2 (L2)'
+            },
+            'L3': {
+                'type': 'polygon',
+                'coords': [(855, 1211), (859, 1237), (1047, 1205), (1042, 1176)],
+                'color': 'green', 'alpha': 0.7,
+                'label': 'Battery 3 (L3) - Fresh, 100% SOC (SOH=100%)'
+            },
+            'L4': {
+                'type': 'rectangle',
+                'coords': {'x_min': 890, 'x_max': 1082, 'y_min': 1251, 'y_max': 1287},
+                'color': 'orange', 'alpha': 0.7,
+                'label': 'Battery 4 (L4) - Discharged, 0% SOC (SOH=56%)'
+            }
+        }
+
+        # SOC 分析参数
+        self.soc_colormap = plt.cm.viridis
+
+        # 全局参考值和最优权重（L3=100% SOC, L4=0% SOC）
+        self.ref_combined_0 = None      # 0% SOC 参考（来自 L4）
+        self.ref_combined_100 = None    # 100% SOC 参考（来自 L3）
+        self.w100 = None                # 100kV 权重
+        self.w150 = None                # 150kV 权重
+
+        self.check_files_exist()
+
+    # ------------------------------------------------------------------
+    # 文件及图像处理
+    # ------------------------------------------------------------------
+    def check_files_exist(self):
+        missing = []
+        if not self.kv100_path.exists():
+            missing.append(str(self.kv100_path))
+        if not self.kv150_path.exists():
+            missing.append(str(self.kv150_path))
+        if missing:
+            print("\nWarning: The following files are missing:")
+            for f in missing:
+                print(f"  - {f}")
+            print("Please place the images in the correct directory.")
+            return False
+        print("All files checked successfully!")
+        return True
+
+    def load_images(self):
+        print("\nLoading images...")
+        if not self.check_files_exist():
+            raise FileNotFoundError("Image files missing.")
+        self.img_kv100 = Image.open(self.kv100_path).convert('L')
+        self.img_kv150 = Image.open(self.kv150_path).convert('L')
+        self.array_kv100 = np.array(self.img_kv100)
+        self.array_kv150 = np.array(self.img_kv150)
+        self.height, self.width = self.array_kv100.shape
+        print(f"100kV shape: {self.array_kv100.shape}")
+        print(f"150kV shape: {self.array_kv150.shape}")
+        return True
+
+    # ------------------------------------------------------------------
+    # 几何辅助
+    # ------------------------------------------------------------------
+    def point_in_polygon(self, x, y, poly):
+        n = len(poly)
+        inside = False
+        p1x, p1y = poly[0]
+        for i in range(n + 1):
+            p2x, p2y = poly[i % n]
+            if y > min(p1y, p2y):
+                if y <= max(p1y, p2y):
+                    if x <= max(p1x, p2x):
+                        if p1y != p2y:
+                            xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
+                        if p1x == p2x or x <= xinters:
+                            inside = not inside
+            p1x, p1y = p2x, p2y
+        return inside
+
+    def extract_region_data(self, region_name):
+        region = self.battery_regions[region_name]
+        if region['type'] == 'rectangle':
+            coords = region['coords']
+            x_min = max(0, coords['x_min'])
+            x_max = min(self.width, coords['x_max'])
+            y_min = max(0, coords['y_min'])
+            y_max = min(self.height, coords['y_max'])
+            kv100_region = self.array_kv100[y_min:y_max, x_min:x_max]
+            kv150_region = self.array_kv150[y_min:y_max, x_min:x_max]
+            yg, xg = np.mgrid[y_min:y_max, x_min:x_max]
+            return (kv100_region.flatten(), kv150_region.flatten(),
+                    xg.flatten(), yg.flatten())
+        else:  # polygon
+            poly = region['coords']
+            xs = [p[0] for p in poly]
+            ys = [p[1] for p in poly]
+            x_min = max(0, min(xs))
+            x_max = min(self.width, max(xs))
+            y_min = max(0, min(ys))
+            y_max = min(self.height, max(ys))
+            kv100_list, kv150_list, x_list, y_list = [], [], [], []
+            for y in range(y_min, y_max):
+                for x in range(x_min, x_max):
+                    if self.point_in_polygon(x, y, poly):
+                        kv100_list.append(self.array_kv100[y, x])
+                        kv150_list.append(self.array_kv150[y, x])
+                        x_list.append(x)
+                        y_list.append(y)
+            return (np.array(kv100_list), np.array(kv150_list),
+                    np.array(x_list), np.array(y_list))
+
+    # ------------------------------------------------------------------
+    # 最优权重计算（LDA）
+    # ------------------------------------------------------------------
+    def _compute_optimal_weights(self, kv100_L3, kv150_L3, kv100_L4, kv150_L4):
+        X3 = np.column_stack((kv100_L3, kv150_L3))
+        X4 = np.column_stack((kv100_L4, kv150_L4))
+        m3 = np.mean(X3, axis=0)
+        m4 = np.mean(X4, axis=0)
+        S3 = np.cov(X3, rowvar=False) * (X3.shape[0] - 1)
+        S4 = np.cov(X4, rowvar=False) * (X4.shape[0] - 1)
+        Sw = S3 + S4
+        d = m3 - m4
+        try:
+            w_raw = np.linalg.solve(Sw, d)
+        except np.linalg.LinAlgError:
+            print("Warning: Sw singular, using mean difference for weights.")
+            w_raw = d
+        total = np.sum(w_raw)
+        if abs(total) < 1e-12:
+            w100, w150 = 0.5, 0.5
+        else:
+            w100 = w_raw[0] / total
+            w150 = w_raw[1] / total
+        if w100 < 0 or w150 < 0:
+            print("Warning: negative weight obtained; taking absolute values and renormalizing.")
+            w_raw_abs = np.abs(w_raw)
+            w100 = w_raw_abs[0] / np.sum(w_raw_abs)
+            w150 = w_raw_abs[1] / np.sum(w_raw_abs)
+        return float(w100), float(w150)
+
+    # ------------------------------------------------------------------
+    # SOC 估计（使用 L3=100% SOC, L4=0% SOC 参考）
+    # ------------------------------------------------------------------
+    def analyze_soc_distribution(self, kv100, kv150, region_name=None):
+        kv100 = kv100.flatten()
+        kv150 = kv150.flatten()
+        w100 = self.w100 if self.w100 is not None else 0.5
+        w150 = self.w150 if self.w150 is not None else 0.5
+        combined = w100 * kv100 + w150 * kv150
+
+        if self.ref_combined_100 is not None and self.ref_combined_0 is not None:
+            soc = 100 * (combined - self.ref_combined_0) / (self.ref_combined_100 - self.ref_combined_0)
+            soc = np.clip(soc, 0, 100)
+        else:
+            # 降级方案：自身归一化（仅当参考未设置时使用）
+            minc, maxc = np.min(combined), np.max(combined)
+            if maxc > minc:
+                normalized = (combined - minc) / (maxc - minc)
+                soc = 100.0 * normalized
+            else:
+                soc = np.full_like(combined, 0.0)
+            soc = np.clip(soc, 0, 100)
+
+        stats = {
+            'mean': float(np.mean(soc)),
+            'median': float(np.median(soc)),
+            'std': float(np.std(soc)),
+            'min': float(np.min(soc)),
+            'max': float(np.max(soc)),
+            'percentile_10': float(np.percentile(soc, 10)),
+            'percentile_90': float(np.percentile(soc, 90)),
+        }
+        return soc, stats
+
+    # ------------------------------------------------------------------
+    # 整体摘要图（左边CT，右边SOC散点图）
+    # ------------------------------------------------------------------
+    def create_region_summary_plot(self, region_name, kv100, kv150, x, y):
+        print(f"\nCreating summary plot for whole {region_name} region...")
+        soc_vals, soc_stats = self.analyze_soc_distribution(kv100, kv150, region_name=region_name)
+        fig = plt.figure(figsize=(16, 8))
+
+        # 左图：CT 图像（带区域轮廓）
+        ax1 = plt.subplot(1, 2, 1)
+        x_min, x_max = np.min(x), np.max(x)
+        y_min, y_max = np.min(y), np.max(y)
+        pad_x = max(10, int((x_max - x_min) * 1.0))
+        pad_y = max(10, int((y_max - y_min) * 1.0))
+        x_min_pad = max(0, x_min - pad_x)
+        x_max_pad = min(self.width, x_max + pad_x)
+        y_min_pad = max(0, y_min - pad_y)
+        y_max_pad = min(self.height, y_max + pad_y)
+
+        ct_img = self.array_kv100[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
+        ax1.imshow(ct_img, cmap='gray', aspect='equal',
+                   extent=[x_min_pad, x_max_pad, y_max_pad, y_min_pad])
+
+        region_info = self.battery_regions[region_name]
+        if region_info['type'] == 'polygon':
+            poly_patch = patches.Polygon(region_info['coords'], closed=True,
+                                         linewidth=3, edgecolor='cyan',
+                                         facecolor='none', linestyle='--')
+            ax1.add_patch(poly_patch)
+        else:
+            rect = patches.Rectangle((x_min, y_min), x_max - x_min, y_max - y_min,
+                                     linewidth=3, edgecolor='cyan',
+                                     facecolor='none', linestyle='--')
+            ax1.add_patch(rect)
+
+        ax1.set_xlabel('X Coordinate')
+        ax1.set_ylabel('Y Coordinate')
+        # 根据区域名设置标题，明确标注 SOC 和 SOH
+        if region_name == 'L3':
+            desc = 'Fresh (100% SOC, SOH=100%)'
+        elif region_name == 'L4':
+            desc = 'Discharged (0% SOC, SOH=56%)'
+        else:
+            desc = ''
+        ax1.set_title(f'{region_name} ({desc}) – CT Image (100kV)', fontsize=14)
+
+        # 右图：SOC 散点图
+        ax2 = plt.subplot(1, 2, 2)
+        max_points = 5000
+        if len(kv100) > max_points:
+            idx = np.random.choice(len(kv100), max_points, replace=False)
+            kv100_sample = kv100[idx]
+            kv150_sample = kv150[idx]
+            soc_sample = soc_vals[idx]
+        else:
+            kv100_sample = kv100
+            kv150_sample = kv150
+            soc_sample = soc_vals
+
+        sc = ax2.scatter(kv100_sample, kv150_sample, c=soc_sample, cmap=self.soc_colormap,
+                         alpha=0.7, s=20, vmin=0, vmax=100)
+        plt.colorbar(sc, ax=ax2, label='SOC (%)')
+        max_val = max(np.max(kv100_sample), np.max(kv150_sample))
+        ax2.plot([0, max_val], [0, max_val], 'k--', alpha=0.5)
+        ax2.set_xlabel('100kV Grayscale')
+        ax2.set_ylabel('150kV Grayscale')
+        ax2.set_title('SOC Distribution (Whole Region)')
+        ax2.grid(True, alpha=0.3)
+
+        stat_text = (f"Mean SOC: {soc_stats['mean']:.1f}%\n"
+                     f"Std Dev: {soc_stats['std']:.1f}%\n"
+                     f"Range: {soc_stats['min']:.1f}–{soc_stats['max']:.1f}%")
+        ax2.text(0.02, 0.98, stat_text, transform=ax2.transAxes, fontsize=10,
+                 verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+        plt.tight_layout()
+        save_path = self.data_dir / f"{region_name.lower()}_summary.png"
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Summary plot saved to: {save_path}")
+        plt.show()
+        return fig
+
+    # ------------------------------------------------------------------
+    # 基于 SOC 区间的综合图形（四子图，5个区间）
+    # ------------------------------------------------------------------
+    def create_soc_based_spatial_analysis(self, region_name, kv100, kv150, x, y):
+        print(f"\nCreating SOC-based spatial analysis for {region_name}...")
+        soc_vals, _ = self.analyze_soc_distribution(kv100, kv150, region_name=region_name)
+
+        bins = [0, 20, 40, 60, 80, 100]
+        bin_labels = ['0-20%', '20-40%', '40-60%', '60-80%', '80-100%']
+        colors = ['red', 'orange', 'yellow', 'green', 'blue']
+        bin_indices = np.digitize(soc_vals, bins) - 1
+        bin_indices = np.clip(bin_indices, 0, 4)
+        unique_bins = np.unique(bin_indices)
+
+        x_min, x_max = int(np.min(x)), int(np.max(x))
+        y_min, y_max = int(np.min(y)), int(np.max(y))
+        width = x_max - x_min + 1
+        height = y_max - y_min + 1
+
+        fig = plt.figure(figsize=(18, 10))
+
+        # 1. 左上大图：CT图像 + 散点
+        ax1 = plt.subplot(2, 3, (1, 2))
+        pad_x = max(20, int((x_max - x_min) * 0.5))
+        pad_y = max(20, int((y_max - y_min) * 0.5))
+        x_min_show = max(0, x_min - pad_x)
+        x_max_show = min(self.width, x_max + pad_x)
+        y_min_show = max(0, y_min - pad_y)
+        y_max_show = min(self.height, y_max + pad_y)
+
+        ct_show = self.array_kv100[y_min_show:y_max_show, x_min_show:x_max_show]
+        ax1.imshow(ct_show, cmap='gray', aspect='equal',
+                   extent=[x_min_show, x_max_show, y_max_show, y_min_show])
+
+        for bin_idx in unique_bins:
+            mask = bin_indices == bin_idx
+            if np.any(mask):
+                ax1.scatter(x[mask], y[mask], c=colors[bin_idx], label=bin_labels[bin_idx], s=1, alpha=0.6)
+
+        region_info = self.battery_regions[region_name]
+        if region_info['type'] == 'polygon':
+            poly_patch = patches.Polygon(region_info['coords'], closed=True,
+                                         linewidth=2, edgecolor='cyan',
+                                         facecolor='none', linestyle='--')
+            ax1.add_patch(poly_patch)
+        else:
+            rect = patches.Rectangle((x_min, y_min), x_max - x_min, y_max - y_min,
+                                     linewidth=2, edgecolor='cyan',
+                                     facecolor='none', linestyle='--')
+            ax1.add_patch(rect)
+
+        ax1.set_xlabel('X Coordinate')
+        ax1.set_ylabel('Y Coordinate')
+        ax1.set_title(f'{region_name} – Spatial Distribution of SOC Intervals')
+        ax1.legend(markerscale=5, fontsize=8)
+        ax1.set_xlim(x_min_show, x_max_show)
+        ax1.set_ylim(y_max_show, y_min_show)
+
+        # 2. 右上：双能量散点图
+        ax2 = plt.subplot(2, 3, 3)
+        for bin_idx in unique_bins:
+            mask = bin_indices == bin_idx
+            if np.any(mask):
+                ax2.scatter(kv100[mask], kv150[mask], c=colors[bin_idx], label=bin_labels[bin_idx], alpha=0.6, s=10)
+        ax2.set_xlabel('100kV Grayscale')
+        ax2.set_ylabel('150kV Grayscale')
+        ax2.set_title(f'{region_name} – Dual-Energy Scatter by SOC Interval')
+        ax2.legend(fontsize=8)
+        ax2.grid(True, alpha=0.3)
+        maxv = max(np.max(kv100), np.max(kv150))
+        ax2.plot([0, maxv], [0, maxv], 'k--', alpha=0.5)
+
+        # 3. 右下：SOC 直方图
+        ax3 = plt.subplot(2, 3, 6)
+        ax3.hist(soc_vals, bins=50, color='gray', alpha=0.7, edgecolor='black')
+        for b in bins:
+            ax3.axvline(b, color='red', linestyle='--', linewidth=1)
+        ax3.set_xlabel('SOC (%)')
+        ax3.set_ylabel('Frequency')
+        ax3.set_title('SOC Histogram with Interval Boundaries')
+
+        # 4. 左下：SOC 区间离散地图
+        ax4 = plt.subplot(2, 3, (4, 5))
+        bin_map = np.full((height, width), -1)
+        for idx in range(len(x)):
+            ix = x[idx] - x_min
+            iy = y[idx] - y_min
+            bin_map[iy, ix] = bin_indices[idx]
+        masked_bin = np.ma.masked_where(bin_map == -1, bin_map)
+        cmap_full = ListedColormap(colors)
+        norm = plt.Normalize(vmin=0, vmax=4)
+        im4 = ax4.imshow(masked_bin, cmap=cmap_full, norm=norm,
+                         extent=[x_min, x_max + 1, y_max + 1, y_min],
+                         aspect='equal', interpolation='none')
+        cbar = plt.colorbar(im4, ax=ax4, ticks=range(5))
+        cbar.ax.set_yticklabels(bin_labels)
+        ax4.set_xlabel('X Coordinate')
+        ax4.set_ylabel('Y Coordinate')
+        ax4.set_title(f'{region_name} – SOC Interval Map')
+
+        plt.tight_layout()
+        save_path = self.data_dir / f"{region_name.lower()}_soc_based_spatial_analysis.png"
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved: {save_path}")
+        plt.show()
+
+        print("\nSOC Interval Statistics:")
+        print("-" * 50)
+        for bin_idx in unique_bins:
+            mask = bin_indices == bin_idx
+            count = np.sum(mask)
+            mean_soc = np.mean(soc_vals[mask])
+            print(f"{bin_labels[bin_idx]}: {count} pixels, mean SOC = {mean_soc:.1f}%")
+        print("-" * 50)
+
+        report_path = self.data_dir / f"{region_name.lower()}_soc_interval_stats.txt"
+        with open(report_path, 'w') as f:
+            f.write(f"SOC Interval Statistics for {region_name}\n")
+            f.write("=" * 50 + "\n")
+            for bin_idx in unique_bins:
+                mask = bin_indices == bin_idx
+                count = np.sum(mask)
+                mean_soc = np.mean(soc_vals[mask])
+                f.write(f"{bin_labels[bin_idx]}: {count} pixels, mean SOC = {mean_soc:.1f}%\n")
+        print(f"Statistics saved to: {report_path}")
+
+    # ------------------------------------------------------------------
+    # 生成标注了L1-L4区域的100kV和150kV CT图像
+    # ------------------------------------------------------------------
+    def create_labeled_ct_images(self):
+        """Create and save labeled CT images for 100kV and 150kV with L1-L4 regions outlined."""
+        if not hasattr(self, 'array_kv100'):
+            self.load_images()
+
+        # 确定包含所有区域并添加边距的显示范围
+        all_x = []
+        all_y = []
+        for region_name in ['L1', 'L2', 'L3', 'L4']:
+            region = self.battery_regions[region_name]
+            if region['type'] == 'rectangle':
+                coords = region['coords']
+                all_x.extend([coords['x_min'], coords['x_max']])
+                all_y.extend([coords['y_min'], coords['y_max']])
+            else:  # polygon
+                xs = [p[0] for p in region['coords']]
+                ys = [p[1] for p in region['coords']]
+                all_x.extend(xs)
+                all_y.extend(ys)
+        x_min_global = max(0, min(all_x) - 50)
+        x_max_global = min(self.width, max(all_x) + 50)
+        y_min_global = max(0, min(all_y) - 50)
+        y_max_global = min(self.height, max(all_y) + 50)
+
+        # 各区域轮廓颜色
+        region_colors = {'L1': 'red', 'L2': 'blue', 'L3': 'green', 'L4': 'orange'}
+
+        # 生成100kV标注图像
+        fig100, ax100 = plt.subplots(1, 1, figsize=(12, 10))
+        img100 = self.array_kv100[y_min_global:y_max_global, x_min_global:x_max_global]
+        ax100.imshow(img100, cmap='gray', aspect='equal',
+                     extent=[x_min_global, x_max_global, y_max_global, y_min_global])
+        ax100.set_title('100 kV CT Image with Battery Regions', fontsize=16)
+        ax100.set_xlabel('X Coordinate')
+        ax100.set_ylabel('Y Coordinate')
+
+        for region_name in ['L1', 'L2', 'L3', 'L4']:
+            region = self.battery_regions[region_name]
+            color = region_colors[region_name]
+            if region['type'] == 'rectangle':
+                coords = region['coords']
+                rect = patches.Rectangle((coords['x_min'], coords['y_min']),
+                                         coords['x_max'] - coords['x_min'],
+                                         coords['y_max'] - coords['y_min'],
+                                         linewidth=2, edgecolor=color, facecolor='none')
+                ax100.add_patch(rect)
+                label_x = (coords['x_min'] + coords['x_max']) / 2
+                label_y = (coords['y_min'] + coords['y_max']) / 2
+                ax100.text(label_x, label_y, region_name, color=color, fontsize=12,
+                           fontweight='bold', ha='center', va='center',
+                           bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
+            else:  # polygon
+                poly = region['coords']
+                poly_patch = patches.Polygon(poly, closed=True, linewidth=2,
+                                             edgecolor=color, facecolor='none')
+                ax100.add_patch(poly_patch)
+                xs = [p[0] for p in poly]
+                ys = [p[1] for p in poly]
+                label_x = sum(xs) / len(xs)
+                label_y = sum(ys) / len(ys)
+                ax100.text(label_x, label_y, region_name, color=color, fontsize=12,
+                           fontweight='bold', ha='center', va='center',
+                           bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
+
+        plt.tight_layout()
+        save_path100 = self.data_dir / "ct_100kv_labeled.png"
+        plt.savefig(save_path100, dpi=300, bbox_inches='tight')
+        print(f"Labeled 100kV CT image saved to: {save_path100}")
+        plt.show()
+
+        # 生成150kV标注图像
+        fig150, ax150 = plt.subplots(1, 1, figsize=(12, 10))
+        img150 = self.array_kv150[y_min_global:y_max_global, x_min_global:x_max_global]
+        ax150.imshow(img150, cmap='gray', aspect='equal',
+                     extent=[x_min_global, x_max_global, y_max_global, y_min_global])
+        ax150.set_title('150 kV CT Image with Battery Regions', fontsize=16)
+        ax150.set_xlabel('X Coordinate')
+        ax150.set_ylabel('Y Coordinate')
+
+        for region_name in ['L1', 'L2', 'L3', 'L4']:
+            region = self.battery_regions[region_name]
+            color = region_colors[region_name]
+            if region['type'] == 'rectangle':
+                coords = region['coords']
+                rect = patches.Rectangle((coords['x_min'], coords['y_min']),
+                                         coords['x_max'] - coords['x_min'],
+                                         coords['y_max'] - coords['y_min'],
+                                         linewidth=2, edgecolor=color, facecolor='none')
+                ax150.add_patch(rect)
+                label_x = (coords['x_min'] + coords['x_max']) / 2
+                label_y = (coords['y_min'] + coords['y_max']) / 2
+                ax150.text(label_x, label_y, region_name, color=color, fontsize=12,
+                           fontweight='bold', ha='center', va='center',
+                           bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
+            else:
+                poly = region['coords']
+                poly_patch = patches.Polygon(poly, closed=True, linewidth=2,
+                                             edgecolor=color, facecolor='none')
+                ax150.add_patch(poly_patch)
+                xs = [p[0] for p in poly]
+                ys = [p[1] for p in poly]
+                label_x = sum(xs) / len(xs)
+                label_y = sum(ys) / len(ys)
+                ax150.text(label_x, label_y, region_name, color=color, fontsize=12,
+                           fontweight='bold', ha='center', va='center',
+                           bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
+
+        plt.tight_layout()
+        save_path150 = self.data_dir / "ct_150kv_labeled.png"
+        plt.savefig(save_path150, dpi=300, bbox_inches='tight')
+        print(f"Labeled 150kV CT image saved to: {save_path150}")
+        plt.show()
+
+        return fig100, fig150
+
+    # ------------------------------------------------------------------
+    # 主运行函数
+    # ------------------------------------------------------------------
+    def run_soc_analysis_for_region(self, region_name):
+        print("="*60)
+        if region_name == 'L3':
+            desc = 'Fresh cathode (100% SOC, SOH=100%)'
+        elif region_name == 'L4':
+            desc = 'Discharged cathode (0% SOC, SOH=56%)'
+        else:
+            desc = ''
+        print(f"Battery SOC Analysis Program – {region_name} Region ({desc})")
+        print("="*60)
+
+        try:
+            if not hasattr(self, 'array_kv100'):
+                self.load_images()
+            print(f"\nExtracting {region_name} data...")
+            kv100, kv150, x, y = self.extract_region_data(region_name)
+            print(f"  {len(kv100):,} pixels, x: {np.min(x):.0f}–{np.max(x):.0f}, y: {np.min(y):.0f}–{np.max(y):.0f}")
+
+            # 对所有区域执行基于SOC区间的空间分析
+            self.create_soc_based_spatial_analysis(region_name, kv100, kv150, x, y)
+
+            # 对所有区域生成整体摘要图
+            self.create_region_summary_plot(region_name, kv100, kv150, x, y)
+
+        except Exception as e:
+            print(f"Error during analysis of {region_name}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def run_soc_analysis(self):
+        print("Battery CT Image Analysis with SOC (Optimal Weights via LDA)")
+        print("=" * 60)
+        try:
+            self.load_images()
+
+            # 提取 L3 和 L4 数据用于权重计算
+            print("\nExtracting L3 and L4 data for optimal weight calculation...")
+            kv100_L3, kv150_L3, _, _ = self.extract_region_data('L3')
+            kv100_L4, kv150_L4, _, _ = self.extract_region_data('L4')
+            print(f"  L3 pixels: {len(kv100_L3):,}")
+            print(f"  L4 pixels: {len(kv100_L4):,}")
+
+            # 计算最优权重
+            print("\nComputing optimal combination weights using Linear Discriminant Analysis...")
+            w100, w150 = self._compute_optimal_weights(kv100_L3, kv150_L3, kv100_L4, kv150_L4)
+            self.w100 = w100
+            self.w150 = w150
+            print(f"  Optimal weights: 100kV = {w100:.4f}, 150kV = {w150:.4f} (sum = {w100 + w150:.4f})")
+
+            # 计算全局参考（L4=0% SOC, L3=100% SOC）
+            print("\nCalculating global SOC references (0%: L4 median, 100%: L3 median) with optimal weights...")
+            combined_L4 = w100 * kv100_L4 + w150 * kv150_L4
+            combined_L3 = w100 * kv100_L3 + w150 * kv150_L3
+            self.ref_combined_0 = float(np.median(combined_L4))
+            self.ref_combined_100 = float(np.median(combined_L3))
+            print(f"  Reference values: 0% SOC = {self.ref_combined_0:.4f} (from L4, SOH=56%), 100% SOC = {self.ref_combined_100:.4f} (from L3, SOH=100%)")
+
+            # 运行分析（L4先，L3后）
+            self.run_soc_analysis_for_region('L4')
+            self.run_soc_analysis_for_region('L3')
+
+            # 最后生成标注了L1-L4区域的CT图像
+            self.create_labeled_ct_images()
+
+        except Exception as e:
+            print(f"Error during analysis: {e}")
+            import traceback
+            traceback.print_exc()
+
+
+if __name__ == "__main__":
+    analyzer = InteractiveBatteryCTAnalyzer(data_dir="result")
+    analyzer.run_soc_analysis()
